@@ -1,0 +1,136 @@
+################################################################################
+### Author: Abraham Pabbathi
+### Purpose: Get up and running quickly with Azure ML
+### Comments: Not all steps can be accomplished via Azure CLI, there are certain steps you need to do in Azure Portal
+###           Documentation Links are provided when you need to switch to Azure Portal to guide you through it
+###           Whenever you see a value inside <> , it means you need to replace it with your own value
+################################################################################
+##### CONNECT TO AZURE
+################################################################################
+# Connect to Azure 
+az login
+
+# Set default subscription
+az account set --subscription "<Subscription-Name>"
+
+# Add extensions - Its a one-time thing
+# az extension list-available --output table
+# az extension add --name azure-cli-ml
+# az extension add --name application-insights
+
+################################################################################
+##### CREATE RESOURCE GROUP
+################################################################################
+# Create Resource Group
+az group create -l eastus -n <rg-name>
+
+az group list --query "[].{location:location,name:name}" -o table
+
+################################################################################
+##### STEP 1: SETUP NETWORKING
+################################################################################
+# Create hub vnet
+az network vnet create --resource-group <rg-name> --name <hub-vnet> --address-prefix 10.1.0.0/16 --subnet-name <hub-subnet> --subnet-prefix 10.1.1.0/24
+
+# Create ML services vnet
+az network vnet create --resource-group <rg-name> --name <ml-vnet> --address-prefix 10.6.0.0/16 --subnet-name <ml-subnet> --subnet-prefix 10.6.1.0/24
+
+# Setup peering between Hub and ML VNET
+az network vnet peering create -g <rg-name> -n hub-ml-conn --vnet-name <hub-vnet> --remote-vnet <ml-vnet> --allow-vnet-access
+az network vnet peering create -g <rg-name> -n ml-hub-conn --vnet-name <ml-vnet> --remote-vnet <hub-vnet> --allow-vnet-access
+
+# Disable private end point network policy to enable no-public-ip compute
+az network vnet subnet update --name <ml-subnet> --resource-group <rg-name> --vnet-name <ml-vnet> --disable-private-endpoint-network-policies true
+az network vnet subnet update --name <ml-subnet> --resource-group <rg-name> --vnet-name <ml-vnet> --disable-private-link-service-network-policies true
+
+################################################################################
+##### STEP 2: SETUP Bastion VM
+################################################################################
+
+# Create a Compute VM with Windows 10 OS in the Hub VNET. Login to your account using Microsoft Edge 
+# While you can access Azure Portal right away,it might take a while before you can access ML Studio as ML studio is extra secure than Azure Portal
+# This is especially relevant for Microsoft Employees as non registered devices are not allowed to access ML Studio
+
+################################################################################
+##### STEP 3: SETUP SUPPORTING SERVICES
+################################################################################
+
+# Create Blob Storage for ML workspace
+az storage account create -n <storage-name> -g <rg-name> -l eastus --sku Standard_RAGRS --allow-blob-public-access false
+
+# Create ML application insights
+az monitor app-insights component create --app <app insights name> --location eastus --kind web --resource-group <rg-name> --application-type web --retention-time 120
+
+# Create Container Registry
+az acr create -n <acr name> --location eastus -g <rg-name> --sku Premium
+
+# Create Keyvault
+az keyvault create --location eastus --name <kv name> --resource-group <rg-name>
+
+################################################################################
+##### STEP 4: CREATE PRIVATE ENDPOINTS FOR STORAGE (Blob and File)
+################################################################################
+
+# https://docs.microsoft.com/en-us/azure/storage/common/storage-private-endpoints
+
+# Add Network access rules
+# Deny access from all networks
+az storage account show --resource-group "<rg-name>" --name "<storage account name>" --query networkRuleSet.defaultAction
+az storage account update --resource-group "<rg-name>" --name "<storage account name>" --default-action Deny
+
+# Setup Service Endpoint for Storage Accounts
+az network service-endpoint policy create --resource-group <rg-name> --name <policy-name> --location eastus
+az network service-endpoint policy-definition create --resource-group <rg-name> `
+ --policy-name <policy-name> --name <policy definition name> --service "Microsoft.Storage"  `
+ --service-resources /subscriptions/5ae15xxxxxxxxx/resourceGroups/<rg-name>/providers/Microsoft.Storage/storageAccounts/<storage account name>
+az network vnet subnet update --vnet-name <ml-vnet> --resource-group <rg-name> --name <ml-subnet> --service-endpoints Microsoft.Storage --service-endpoint-policy <policy-name>
+
+# Setup Storage Account to accept connections from only certain VNET/Subnets
+az storage account network-rule add -g <rg-name> --account-name <storage account name> --vnet-name <ml-vnet> --subnet <ml-subnet>
+
+# Create ADLS Blob Storage Private Endpoints and DNS Zones using ARM Template
+cd CLI\06-ml
+dir
+az deployment group create -g <rg-name> --template-file storage-pe-template.json --parameters @storage-pe-parameters.json
+# Enable link to hub vnet
+az network private-dns link vnet create -g <rg-name> -n <link-name> -z privatelink.blob.core.windows.net -v <hub-vnet> -e False
+
+az deployment group create -g <rg-name> --template-file files-pe-template.json --parameters @files-pe-parameters.json
+
+################################################################################
+##### STEP 5: CREATE PRIVATE ENDPOINTS FOR SUPPORT SERVICES
+################################################################################
+
+# Creation of private end point for Key Vault is done via Azure Portal
+
+# Creation of private end point for Container Registry is done via Azure Portal
+
+# Creation of private end point for App Insights via portal
+# https://docs.microsoft.com/en-us/azure/azure-monitor/logs/private-link-security
+
+################################################################################
+##### STEP 6: Create Links between Private DNS Zones and Hub VNET
+################################################################################
+
+# Enable link to hub vnet
+az network private-dns link vnet create -g <rg-name> -n <link-name> -z privatelink.file.core.windows.net -v <hub-vnet> -e False
+
+################################################################################
+##### STEP 7: CREATE ML WORKSPACE
+################################################################################
+
+# Create Azure ML Workspace
+az ml workspace create --workspace-name <ml-ws-name> --location eastus --resource-group <rg-name> --sku enterprise  `
+--application-insights /subscriptions/5ae15b64-451e-45c3-b3e7-65021e55740b/resourceGroups/<rg-name>/providers/microsoft.insights/components/<app insights name>  `
+--container-registry /subscriptions/5ae15b64-451e-45c3-b3e7-65021e55740b/resourceGroups/<rg-name>/providers/Microsoft.ContainerRegistry/registries/<acr-name>  `
+--keyvault /subscriptions/5ae15b64-451e-45c3-b3e7-65021e55740b/resourceGroups/<rg-name>/providers/Microsoft.KeyVault/vaults/<kv name> `
+--storage-account /subscriptions/5ae15b64-451e-45c3-b3e7-65021e55740b/resourceGroups/<rg-name>/providers/Microsoft.Storage/storageAccounts/<storage name>
+
+################################################################################
+##### STEP 8: CREATE PRIVATE END POINT FOR ML WORKSPACE
+################################################################################
+# https://docs.microsoft.com/en-us/azure/machine-learning/how-to-configure-private-link?tabs=azure-portal
+
+################################################################################
+##### STEP 9: Update Authentication for default Workspace Storage and Files (Create file link if needed)
+################################################################################
